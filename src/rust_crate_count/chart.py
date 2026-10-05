@@ -2,10 +2,113 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import matplotlib
 from matplotlib import pyplot as plt
+from matplotlib import dates as mdates
 from matplotlib.ticker import MaxNLocator, StrMethodFormatter
 
-from rust_crate_count.crates_io import YearlyCrateCount
+from rust_crate_count.crates_io import RollingCrateCount, YearlyCrateCount
+
+# Artifacts are generated headlessly; avoid needing a display or an X connection.
+matplotlib.use("Agg")
+
+STYLE = {
+    "font.family": "DejaVu Sans",
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "axes.edgecolor": "#333333",
+    "axes.labelcolor": "#222222",
+    "xtick.color": "#333333",
+    "ytick.color": "#333333",
+    "text.color": "#222222",
+    "axes.titleweight": "bold",
+}
+
+
+def write_rolling_chart(
+    rows: list[RollingCrateCount], dump_timestamp: str, output_stem: Path
+) -> list[Path]:
+    if not rows:
+        raise ValueError("rows must not be empty")
+
+    months = [row.month for row in rows]
+    released = [row.released_last_12m for row in rows]
+    registered = [row.registered for row in rows]
+
+    plt.rcParams.update(STYLE)
+
+    fig, ax = plt.subplots(figsize=(12, 6.4), dpi=180)
+    fig.subplots_adjust(left=0.085, right=0.985, top=0.8, bottom=0.16)
+
+    fig.text(
+        0.085,
+        0.955,
+        "crates.io: crates released in the last 12 months",
+        fontsize=21,
+        fontweight="bold",
+        ha="left",
+        va="top",
+    )
+    fig.text(
+        0.085,
+        0.912,
+        f"Source: crates.io DB dump, {dump_timestamp}. Current (non-deleted) crates only.",
+        fontsize=10.5,
+        color="#666666",
+        ha="left",
+        va="top",
+    )
+
+    ax.plot(
+        months,
+        registered,
+        color="#B0B7BF",
+        linewidth=2.2,
+        label="registered crates (cumulative)",
+    )
+    ax.plot(
+        months,
+        released,
+        color="#0072B2",
+        linewidth=2.8,
+        marker="o",
+        markersize=2.5,
+        label="crates released in the last 12 months",
+    )
+    ax.set_ylabel("Crates")
+    ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ax.set_ylim(bottom=0)
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y/1/1"))
+    ax.grid(color="#e6e8eb", linewidth=0.9)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(frameon=False, loc="upper left")
+
+    fig.text(
+        0.085,
+        0.045,
+        "Counting rule: a crate counts when it published at least one version in the "
+        "previous 365 days.",
+        fontsize=9,
+        color="#666666",
+        ha="left",
+    )
+    fig.text(
+        0.085,
+        0.014,
+        f"The last point is {rows[-1].month.date().isoformat()}, so its window ends before "
+        "the dump timestamp.",
+        fontsize=9,
+        color="#666666",
+        ha="left",
+    )
+
+    output_stem.parent.mkdir(parents=True, exist_ok=True)
+    paths = [output_stem.with_suffix(ext) for ext in [".png", ".pdf", ".svg"]]
+    for path in paths:
+        fig.savefig(path)
+    plt.close(fig)
+    return paths
 
 
 def write_chart(rows: list[YearlyCrateCount], dump_timestamp: str, output_stem: Path) -> list[Path]:
@@ -18,19 +121,7 @@ def write_chart(rows: list[YearlyCrateCount], dump_timestamp: str, output_stem: 
     labels = [str(year) for year in years]
     partial_year = rows[-1].year if rows[-1].partial_year else None
 
-    plt.rcParams.update(
-        {
-            "font.family": "DejaVu Sans",
-            "figure.facecolor": "white",
-            "axes.facecolor": "white",
-            "axes.edgecolor": "#333333",
-            "axes.labelcolor": "#222222",
-            "xtick.color": "#333333",
-            "ytick.color": "#333333",
-            "text.color": "#222222",
-            "axes.titleweight": "bold",
-        }
-    )
+    plt.rcParams.update(STYLE)
 
     fig, (ax1, ax2) = plt.subplots(
         2,

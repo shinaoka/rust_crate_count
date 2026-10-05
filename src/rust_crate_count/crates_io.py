@@ -7,13 +7,15 @@ import re
 import subprocess
 import sys
 import tarfile
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
 DB_DUMP_URL = "https://static.crates.io/db-dump.tar.gz"
+ROLLING_WINDOW_DAYS = 365
 
 
 @dataclass(frozen=True)
@@ -33,10 +35,19 @@ class YearlyCrateCount:
 
 
 @dataclass(frozen=True)
+class RollingCrateCount:
+    month: datetime
+    released_last_12m: int
+    registered: int
+
+
+@dataclass(frozen=True)
 class DumpData:
     timestamp: datetime
     current_created: list[datetime]
     deleted_crates: list[DeletedCrate]
+    # Current (non-deleted) crates only: crate id -> sorted version created_at values.
+    releases_by_crate: dict[int, list[datetime]]
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -55,6 +66,55 @@ def parse_timestamp(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def month_starts(start: datetime, end: datetime) -> list[datetime]:
+    month = start.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    months: list[datetime] = []
+    while month <= end:
+        months.append(month)
+        month = (month.replace(day=28) + timedelta(days=5)).replace(day=1)
+    return months
+
+
+def monthly_rolling_counts(dump: DumpData) -> list[RollingCrateCount]:
+    """Count crates with any release in the trailing window, at each month start.
+
+    A crate counts at month m when at least one of its releases falls in
+    (m - ROLLING_WINDOW_DAYS, m]. Each crate contributes at most one count per month,
+    even when several of its releases fall inside the window.
+    """
+    created = sorted(dump.current_created)
+    if not created:
+        return []
+
+    months = month_starts(created[0], dump.timestamp)
+    window = timedelta(days=ROLLING_WINDOW_DAYS)
+    delta = [0] * (len(months) + 1)
+
+    for releases in dump.releases_by_crate.values():
+        for index, release in enumerate(releases):
+            end = release + window
+            if index + 1 < len(releases) and releases[index + 1] < end:
+                end = releases[index + 1]
+            start_month = bisect_left(months, release)
+            end_month = bisect_left(months, end)
+            if end_month > start_month:
+                delta[start_month] += 1
+                delta[end_month] -= 1
+
+    rows: list[RollingCrateCount] = []
+    active = 0
+    for index, month in enumerate(months):
+        active += delta[index]
+        rows.append(
+            RollingCrateCount(
+                month=month,
+                released_last_12m=active,
+                registered=bisect_right(created, month),
+            )
+        )
+    return rows
+
+
 def download_dump(url: str, path: Path, force: bool = False) -> None:
     if path.exists() and not force:
         return
@@ -70,7 +130,9 @@ def _dump_member(tar: tarfile.TarFile, suffix: str) -> tarfile.TarInfo:
 def read_dump(path: Path) -> DumpData:
     csv.field_size_limit(sys.maxsize)
     current_created: list[datetime] = []
+    current_ids: set[int] = set()
     deleted_crates: list[DeletedCrate] = []
+    releases_by_crate: dict[int, list[datetime]] = {}
 
     with tarfile.open(path, "r:gz") as tar:
         metadata_member = _dump_member(tar, "/metadata.json")
@@ -82,6 +144,7 @@ def read_dump(path: Path) -> DumpData:
             text = io.TextIOWrapper(raw, encoding="utf-8", newline="")
             for row in csv.DictReader(text):
                 current_created.append(parse_timestamp(row["created_at"]))
+                current_ids.add(int(row["id"]))
 
         deleted_member = _dump_member(tar, "/data/deleted_crates.csv")
         with tar.extractfile(deleted_member) as raw:
@@ -94,7 +157,26 @@ def read_dump(path: Path) -> DumpData:
                     )
                 )
 
-    return DumpData(timestamp=timestamp, current_created=current_created, deleted_crates=deleted_crates)
+        versions_member = _dump_member(tar, "/data/versions.csv")
+        with tar.extractfile(versions_member) as raw:
+            text = io.TextIOWrapper(raw, encoding="utf-8", newline="")
+            for row in csv.DictReader(text):
+                crate_id = int(row["crate_id"])
+                if crate_id not in current_ids:
+                    continue
+                releases_by_crate.setdefault(crate_id, []).append(
+                    parse_timestamp(row["created_at"])
+                )
+
+    for releases in releases_by_crate.values():
+        releases.sort()
+
+    return DumpData(
+        timestamp=timestamp,
+        current_created=current_created,
+        deleted_crates=deleted_crates,
+        releases_by_crate=releases_by_crate,
+    )
 
 
 def yearly_counts(
@@ -135,6 +217,15 @@ def yearly_counts(
         )
 
     return rows
+
+
+def write_rolling_csv(rows: list[RollingCrateCount], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["month", "released_last_12m", "registered"])
+        for row in rows:
+            writer.writerow([row.month.date().isoformat(), row.released_last_12m, row.registered])
 
 
 def write_counts_csv(rows: list[YearlyCrateCount], path: Path) -> None:
